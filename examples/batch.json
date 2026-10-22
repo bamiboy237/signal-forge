@@ -1,0 +1,44 @@
+{
+  "readings": [
+    {
+      "event_id": "evt-001",
+      "sensor_id": "kiln-01",
+      "observed_at": "2026-10-22T10:00:00Z",
+      "kind": "temperature",
+      "value": 176,
+      "unit": "F"
+    },
+    {
+      "event_id": "evt-002",
+      "sensor_id": "greenhouse-02",
+      "observed_at": "2026-10-22T10:01:00Z",
+      "kind": "humidity",
+      "value": 12,
+      "unit": "%"
+    },
+    {
+      "event_id": "evt-003",
+      "sensor_id": "lab-03",
+      "observed_at": "2026-10-22T10:02:00Z",
+      "kind": "temperature",
+      "value": 22,
+      "unit": "C"
+    },
+    {
+      "event_id": "evt-004",
+      "sensor_id": "greenhouse-02",
+      "observed_at": "2026-10-22T10:03:00Z",
+      "kind": "humidity",
+      "value": 140,
+      "unit": "%"
+    },
+    {
+      "event_id": "evt-001",
+      "sensor_id": "kiln-01",
+      "observed_at": "2026-10-22T10:00:00Z",
+      "kind": "temperature",
+      "value": 176,
+      "unit": "F"
+    }
+  ]
+}
