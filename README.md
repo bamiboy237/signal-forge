@@ -1,7 +1,8 @@
 # Signal Forge
 
 Build a local sensor-event workflow: submit a batch, run its processing pipeline, and inspect the alert report.
-The sample uses synthetic kiln, greenhouse, and lab readings. It makes no external API calls and needs no secrets.
+The sample uses synthetic kiln, greenhouse, and lab readings. Processing runs locally.
+Optional manual dispatch sends alert summaries to a configured HTTPS webhook.
 
 ## Run the API
 
@@ -63,7 +64,7 @@ Run each command from `signal-forge/`, not the parent workspace.
 5. Stop and restart the API.
    Retrieve the batch again to confirm that SQLite kept its state.
 
-## Check the baseline
+## Run checks
 
 ```sh
 uv run --locked pytest
@@ -73,12 +74,29 @@ uv run --locked ruff format --check src tests
 
 Tests use temporary databases and synthetic data. They do not contact external services.
 
-## Test a coding agent
+## Deliver alerts
 
-Give the next agent this prompt:
+A completed batch with accepted warning or critical readings creates one durable summary
+in the same SQLite transaction as its report. Normal-only and all-quarantined batches
+create no delivery. Inspect it at `GET /v1/batches/{batch_id}/delivery`.
 
-> Work only in `signal-forge/`. Read `README.md`, `API.md`, and `AGENT_TASK.md`. Run the baseline checks, then implement the durable alert-delivery task in `AGENT_TASK.md`. Preserve the existing API behavior. Add tests for failures, restarts, and concurrent dispatch. Report the changed files and the checks that passed.
+Set `SIGNAL_FORGE_WEBHOOK_URL` to your receiver's HTTPS URL in the API process environment.
+Then explicitly dispatch up to ten due deliveries:
 
-The baseline is complete. `AGENT_TASK.md` describes a new feature, not an intentionally hidden defect.
+```sh
+curl --fail-with-body http://127.0.0.1:8000/v1/deliveries/dispatch \
+  -H 'Content-Type: application/json' --data '{"limit":10}'
+```
+
+There is no background worker. Call dispatch again when retries become due.
+The limit is 1–100. Missing or invalid HTTPS configuration returns `503` without attempts.
+Network failures, `429`, and `5xx` retry after 1, 2, 4, and 8 seconds; the fifth failed
+attempt is dead. Other non-2xx responses, including redirects, are immediately dead.
+Successful and dead records remain available for inspection across restarts.
+
+Delivery is at least once. Receivers should deduplicate the stable `Idempotency-Key`.
+Expiring claims recover interrupted workers; an interrupted request may have reached
+the receiver even when the local result was never recorded. See the API reference
+for claim expiry and attempt accounting.
 
 For the current contract, storage rules, and known limits, read [API.md](API.md).

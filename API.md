@@ -13,6 +13,8 @@ There is no background worker or automatic processing.
 | `GET`  | `/v1/batches/{batch_id}`        | `200` with the batch ID, status, timestamps, and reading count.                         |
 | `POST` | `/v1/batches/{batch_id}/run`    | `200` with the processed report. Completed batches return the saved report.             |
 | `GET`  | `/v1/batches/{batch_id}/report` | `200` with the saved report. `409` if the batch is pending.                             |
+| `GET` | `/v1/batches/{batch_id}/delivery` | `200` with the saved delivery; `404` if none exists. |
+| `POST` | `/v1/deliveries/dispatch` | `200` with outcome counts for bounded manual dispatch. |
 | `GET`  | `/docs`                         | Interactive OpenAPI documentation. The UI uses CDN assets and can need internet access. |
 | `GET`  | `/openapi.json`                 | Machine-readable API schema.                                                            |
 
@@ -95,23 +97,107 @@ Submission uses `BEGIN IMMEDIATE` to make the key check and insert one transacti
 Concurrent submissions with the same key cannot create multiple batches.
 
 Processing also uses one `BEGIN IMMEDIATE` transaction.
-The transaction includes the pipeline execution and the report write.
+The transaction includes pipeline execution, the report write, and any alert outbox insert.
+A unique batch ID in the outbox prevents duplicate deliveries.
 A completed batch returns its saved report instead of rerunning the pipeline.
 This prevents duplicate processing by concurrent requests against the same file.
 An exception or process exit before commit leaves the batch pending.
-Reports, keys, and timestamps survive an application restart.
+Reports, deliveries, keys, and timestamps survive an application restart.
 
 A saved report keeps the pipeline version used for that run.
 A future code change does not rescore completed batches automatically.
+
+## Durable alert delivery
+
+A completed batch creates one delivery if its accepted readings include a warning or critical
+severity. Normal-only and all-quarantined batches create none. An exception during processing
+or either persistence write rolls back both the report and delivery. Running a completed
+batch returns its saved report without creating another delivery. Existing completed batches
+from before this feature are not backfilled.
+
+`GET /v1/batches/{batch_id}/delivery` returns this shape:
+
+```json
+{
+  "id": "delivery-uuid",
+  "batch_id": "batch-uuid",
+  "payload": {
+    "delivery_id": "delivery-uuid",
+    "batch_id": "batch-uuid",
+    "pipeline_version": "1",
+    "severity_counts": {"normal": 1, "warning": 1, "critical": 1}
+  },
+  "status": "pending",
+  "attempt_count": 0,
+  "next_attempt_at": "2026-10-23T12:00:00Z",
+  "last_error": null
+}
+```
+
+The UUIDs above are placeholders. Unknown batches, pending batches, and completed batches
+without an alert return `404` on this route. Invalid UUIDs return `422`.
+The payload is saved once and sent unchanged across retries with its delivery ID in the
+outbound `Idempotency-Key` header. It contains summary counts only, with all three severity keys.
+
+`POST /v1/deliveries/dispatch` accepts a JSON object `{"limit":10}`; `{}` uses the default 10.
+`limit` must be an integer from 1 through 100. Invalid limits, unknown fields, and a missing
+body return `422`. Callers cannot supply a webhook URL. The response contains integer counts:
+
+```json
+{"attempted": 2, "succeeded": 1, "retried": 1, "dead": 0, "stale": 0}
+```
+
+`attempted` counts sends started by this call. The other counts sum to `attempted`.
+`stale` means a newer claim or expiry recovery superseded this worker's result, which
+was discarded. An empty queue or only future retries returns all zeroes.
+Each call sends at most `limit` requests and considers each delivery at most once.
+There is no background loop or automatic dispatch on batch completion.
+
+`SIGNAL_FORGE_WEBHOOK_URL` must contain an HTTPS URL with a host. Missing or invalid
+configuration returns `503` with a generic message before claims or attempts are consumed.
+The configured URL is read for each dispatch call and is never saved in the queue or returned.
+Requests use a ten-second timeout for each HTTP operation, disable redirects and environment
+proxy settings, and ignore receiver bodies. Response bodies and exception text are never
+persisted. Errors contain only `HTTP <status>` or `Network failure` (or the final claim-expiry
+message below), preventing credential-bearing URLs from appearing in API errors.
+
+| Status | Meaning |
+| --- | --- |
+| `pending` | Waiting for its initial send or next retry time. |
+| `in_flight` | A worker holds a claim for a reserved attempt. |
+| `succeeded` | Any `2xx` response was received. Retained for inspection. |
+| `dead` | Terminal response, exhausted retries, or expired final attempt. Retained for inspection. |
+
+Network exceptions, `429`, and `500–599` responses retry after 1, 2, 4, and 8 seconds,
+measured from completion of the failed attempt. After five failed attempts the delivery is
+`dead`. Other non-2xx statuses, including redirects, become `dead` immediately.
+Terminal records have `next_attempt_at: null`; success also clears `last_error`.
+There is no automatic retry or redrive of terminal records.
+
+Claims reserve an attempt and expire after 60 seconds. A short SQLite write transaction
+selects a due record and assigns a unique claim identity. HTTP runs after that transaction
+commits. Another dispatcher cannot claim an active record. After expiry, a dispatcher can
+recover it, including after process restart. Each reservation consumes an attempt even if
+its worker stops before sending or writing a result. An expired fifth reservation is marked
+`dead` with `Claim expired after final attempt` on a later dispatch; this maintenance does
+not count as an HTTP attempt in that call's response. Result writes check claim identity,
+so an old worker cannot overwrite a newer claim or its result.
+
+Delivery is **at least once**, not exactly once. A worker can stop after the receiver accepts
+the request but before SQLite records success. A request that outlives its lease can overlap
+with a recovery attempt. The receiver must deduplicate stable delivery IDs. Dispatch requests
+run synchronously and may take time proportional to the limit and network operation timeouts.
 
 ## Source map
 
 - `src/signal_forge/models.py`: request and response contracts.
 - `src/signal_forge/pipeline.py`: deterministic normalization, quarantine, and scoring.
 - `src/signal_forge/storage.py`: SQLite schema, idempotency, and atomic processing.
+- `src/signal_forge/delivery.py`: bounded dispatch and HTTPS sender.
 - `src/signal_forge/api.py`: application factory, HTTP routes, and error mapping.
 - `tests/test_pipeline.py`: rule and boundary tests.
 - `tests/test_api.py`: API, persistence, rollback, and concurrency tests.
+- `tests/test_delivery.py`: outbox, retry, transport, and claim acceptance tests.
 - `examples/batch.json`: synthetic demonstration input.
 
 ## Limits
@@ -120,8 +206,9 @@ This is an agent exercise, not a production monitoring service.
 There is no authentication, tenant isolation, body-byte limit, retention policy, rate limit, or database migration system.
 The database has one writer at a time. Pipeline execution holds the write lock and blocks unrelated writes.
 Request bodies and responses stay in memory. The API accepts at most 500 readings per batch.
-There is no batch list route, automatic worker, webhook delivery, or external event source.
+There is no batch list route, automatic worker, or external event source.
 
 The documented launch command binds only to `127.0.0.1`.
-The API and tests need no network after dependency installation.
+Local processing and tests need no network after dependency installation.
+Manual webhook dispatch requires access to the configured HTTPS receiver.
 The interactive documentation can load JavaScript and CSS from a CDN.
