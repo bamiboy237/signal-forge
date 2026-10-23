@@ -63,6 +63,7 @@ class QuarantinedReading(Model):
 
 class PipelineReport(Model):
     pipeline_version: str
+    ruleset_version: int = 1
     total: int
     accepted: int
     quarantined: int
@@ -98,6 +99,53 @@ class DeliveryView(Model):
     attempt_count: int
     next_attempt_at: AwareDatetime | None
     last_error: str | None
+
+
+class Rule(Model):
+    id: Identifier
+    when: str = Field(min_length=1, max_length=500)
+    severity: Severity
+    reason: str = Field(min_length=1, max_length=200)
+
+    @field_validator("when")
+    @classmethod
+    def validate_expression(cls, value: str) -> str:
+        from .rules import parse_expression
+
+        parse_expression(value)
+        return value
+
+    @field_validator("reason")
+    @classmethod
+    def validate_placeholders(cls, value: str) -> str:
+        import re
+
+        for placeholder in re.findall(r"\{([^{}]*)\}", value):
+            if placeholder not in {"sensor_id", "unit", "value"}:
+                raise ValueError(f"Unknown reason placeholder: {placeholder}")
+        return value
+
+
+class RuleSetRequest(Model):
+    rules: list[Rule] = Field(min_length=1, max_length=50)
+    note: str = Field(default="", max_length=200)
+
+    @field_validator("rules")
+    @classmethod
+    def unique_ids(cls, rules: list[Rule]) -> list[Rule]:
+        if len({rule.id for rule in rules}) != len(rules):
+            raise ValueError("Duplicate rule IDs")
+        return rules
+
+
+class RuleSetView(RuleSetRequest):
+    version: int
+    created_at: AwareDatetime
+    active: bool
+
+
+class ReplayRequest(Model):
+    limit: int = Field(default=20, ge=1, le=100, strict=True)
 
 
 class DispatchRequest(Model):

@@ -1,0 +1,13 @@
+{
+  "mcp": {
+    "servers": {
+      "agent-handoff": {
+        "type": "local",
+        "command": [
+          "node",
+          "/Users/king/.local/share/agent-handoff/node_modules/agent-handoff/dist/index.js"
+        ]
+      }
+    }
+  }
+}
