@@ -74,11 +74,12 @@ The processing order is duplicate detection, unit normalization, range validatio
 | Temperature | Below `60 C`         | At least `60 C`, below `80 C` | At least `80 C` |
 | Humidity    | `20–80 %`, inclusive | Below `20 %` or above `80 %`  | Never           |
 
-These are fixed demo rules, not validated industrial safety thresholds.
+These are the default version 1 demo rules, not validated industrial safety thresholds.
+New rule versions can replace severity scoring as described below.
 
 ### Reports
 
-`pipeline_version` is `"1"`. Reports include `total`, `accepted`, `quarantined`, and all three `severity_counts` keys.
+`pipeline_version` is `"1"`. `ruleset_version` identifies the rule version used. Reports include `total`, `accepted`, `quarantined`, and all three `severity_counts` keys.
 Only accepted readings contribute to severity counts.
 `total = accepted + quarantined` and `accepted = sum(severity_counts.values())`.
 
@@ -212,3 +213,105 @@ The documented launch command binds only to `127.0.0.1`.
 Local processing and tests need no network after dependency installation.
 Manual webhook dispatch requires access to the configured HTTPS receiver.
 The interactive documentation can load JavaScript and CSS from a CDN.
+
+## Versioned alert rules
+
+| Method | Route | Result |
+| --- | --- | --- |
+| GET | `/v1/rules` | All versions, oldest first. |
+| GET | `/v1/rules/active` | The active version. |
+| POST | `/v1/rules` | Create an inactive version; `201` with `Location: /v1/rules/{version}`. |
+| GET | `/v1/rules/{version}` | One version. |
+| POST | `/v1/rules/{version}/activate` | Activate a version and return it with `200`. |
+| POST | `/v1/rules/{version}/replay` | Preview scoring on completed batches with `200`. |
+
+Unknown versions return `404` with `{"detail":"Rule set not found"}`.
+Rule contents never change after creation. Versions increase from 1, and exactly one
+is active. SQLite preserves history and activation across restarts. Pending batches
+use the active version when run; completed batches return their original report.
+The one-argument Python function `run_pipeline(batch)` always uses version 1.
+Legacy reports without a rule version are read as version 1.
+
+Creation accepts `rules` (1–50 entries) and optional `note` (null or at most 200
+characters). Each rule has exactly `id`, `when`, `severity`, and `reason`:
+
+```json
+{
+  "rules": [{"id": "hot", "when": "value >= 70", "severity": "critical", "reason": "{sensor_id} reads {value} {unit}."}],
+  "note": "Try a lower alert threshold"
+}
+```
+
+IDs use the sensor ID format and must be unique within a version. `when` is 1–500
+characters, severity is `normal`, `warning`, or `critical`, and reason is 1–200
+characters. Unknown fields are rejected. Versions are returned as:
+
+```json
+{
+  "version": 2,
+  "rules": [{"id": "hot", "when": "value >= 70", "severity": "critical", "reason": "{sensor_id} reads {value} {unit}."}],
+  "note": "Try a lower alert threshold",
+  "created_at": "2026-10-23T12:00:00Z",
+  "active": false
+}
+```
+
+### Expression language
+
+Fields `kind`, `sensor_id`, and `unit` are strings; `value` is the normalized number
+(Celsius or humidity percent). Keywords and field/function names are lowercase.
+Numbers allow a leading minus and an optional fractional part, such as `-10.5`.
+Strings use double quotes; backslash-quote escapes a quote and double backslash
+escapes a backslash. Whitespace between tokens has no meaning.
+
+Use `==` or `!=` between values of the same type. Ordered comparisons `<`, `<=`,
+`>`, and `>=` require numbers. `matches` requires a string on the left and a string
+literal on the right: `sensor_id matches "kiln-*"`. It matches the whole string;
+`*` matches any run, `?` matches one character, and all other characters are literal.
+
+Combine boolean comparisons with `not`, `and`, and `or`, in that precedence order;
+parentheses group expressions. For example:
+`not kind == "humidity" and (value > 90 or sensor_id == "kiln-2")`.
+A lone value is invalid. Expressions are parsed and type-checked at creation.
+Errors return `422` in the existing validation shape, located on the relevant field
+(e.g. `["body", "rules", 1, "when"]`). Syntax messages include the 1-based character
+position. Duplicate IDs are located on `["body", "rules"]`.
+
+`avg(value, n)` returns the mean of the last `n` accepted readings for the same
+sensor and kind, including the current reading. The window must be an integer
+from 1 through 20. `delta(value)` subtracts the previous accepted value from the
+current one. History is limited to the current batch and ordered by observation
+time, breaking ties by input position. Quarantined readings do not count.
+Insufficient history produces null; every comparison with null, including `!=`,
+is false. Thus `not delta(value) > 1` is true for a first reading.
+
+The first matching rule sets severity and reason. With no match the result is
+`normal` with reason `No rule matched.` Reasons substitute `{sensor_id}`, `{unit}`,
+and `{value}`; other placeholders are rejected. Values use general numeric format,
+so `80.0` renders as `80`. Normalization, quarantine, output ordering, and webhook
+outbox behavior follow the existing pipeline contract.
+
+### Replay response
+
+Replay requires a JSON body. `{}` selects the default limit of 20; `{"limit":10}`
+selects up to ten most recently completed batches, newest completion first.
+The limit must be a strict integer from 1 through 100; strings, floats, booleans,
+unknown fields, and out-of-range limits return `422`. Pending batches are excluded.
+Each stored input is processed independently with the selected version:
+
+```json
+{
+  "version": 2,
+  "batches": [{
+    "batch_id": "batch-uuid",
+    "ruleset_version": 1,
+    "before": {"normal": 2, "warning": 0, "critical": 0},
+    "after": {"normal": 1, "warning": 0, "critical": 1},
+    "changes": [{"event_id": "evt-4", "before": "normal", "after": "critical"}]
+  }]
+}
+```
+
+`ruleset_version` identifies the stored report's version. `changes` contains only
+severity changes, in input order; reason-only changes are omitted. Replay writes
+nothing: reports, deliveries, batch states, and activation remain unchanged.

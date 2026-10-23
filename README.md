@@ -100,3 +100,27 @@ the receiver even when the local result was never recorded. See the API referenc
 for claim expiry and attempt accounting.
 
 For the current contract, storage rules, and known limits, read [API.md](API.md).
+
+## Try a new rule version
+
+After processing the sample batch, create an inactive version against the local API:
+
+```sh
+curl --fail-with-body -i http://127.0.0.1:8000/v1/rules \
+  -H 'Content-Type: application/json' \
+  --data '{"rules":[{"id":"hot","when":"value >= 70","severity":"critical","reason":"{sensor_id} reads {value} {unit}."}],"note":"Try a lower alert threshold"}'
+```
+
+On a fresh database this returns version 2. Use the returned version in the next URLs
+if you have already created other versions. Preview severity changes on the latest
+20 completed batches, then activate the version:
+
+```sh
+curl --fail-with-body http://127.0.0.1:8000/v1/rules/2/replay \
+  -H 'Content-Type: application/json' --data '{"limit":20}'
+curl --fail-with-body -X POST http://127.0.0.1:8000/v1/rules/2/activate
+```
+
+Replay leaves reports and deliveries unchanged. Activation affects pending batches
+when they run; completed batches keep their saved results. Inspect the current version
+at `GET /v1/rules/active`. Activate version 1 again to restore the original thresholds.
