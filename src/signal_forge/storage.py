@@ -13,6 +13,9 @@ from .models import (
     DeliveryPayload,
     DeliveryView,
     PipelineReport,
+    ReplayBatch,
+    ReplayChange,
+    ReplayResult,
     RuleSetRequest,
     RuleSetView,
 )
@@ -234,8 +237,11 @@ class Store:
             active = self._ruleset(
                 connection.execute("SELECT * FROM rule_sets WHERE active = 1").fetchone()
             )
-            report = run_pipeline(
-                BatchRequest.model_validate_json(row["payload"]), active.rules, active.version
+            batch = BatchRequest.model_validate_json(row["payload"])
+            report = (
+                run_pipeline(batch)
+                if active.version == 1
+                else run_pipeline(batch, active.rules, active.version)
             )
             connection.execute(
                 """
@@ -262,6 +268,39 @@ class Store:
                     ),
                 )
             return report
+
+    def replay(self, version: int, limit: int) -> ReplayResult:
+        with self.connect() as connection:
+            # One read snapshot covers the selected version and all original reports.
+            connection.execute("BEGIN")
+            ruleset = self._ruleset(self._find_ruleset(connection, version))
+            rows = connection.execute(
+                "SELECT * FROM batches WHERE status = 'completed' "
+                "ORDER BY completed_at DESC, rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            batches = []
+            for row in rows:
+                before = PipelineReport.model_validate_json(row["report"])
+                after = run_pipeline(
+                    BatchRequest.model_validate_json(row["payload"]), ruleset.rules, version
+                )
+                batches.append(
+                    ReplayBatch(
+                        batch_id=row["id"],
+                        ruleset_version=before.ruleset_version,
+                        before=before.severity_counts,
+                        after=after.severity_counts,
+                        changes=[
+                            ReplayChange(
+                                event_id=old.event_id, before=old.severity, after=new.severity
+                            )
+                            for old, new in zip(before.readings, after.readings, strict=True)
+                            if old.severity != new.severity
+                        ],
+                    )
+                )
+            return ReplayResult(version=version, batches=batches)
 
     def delivery(self, batch_id: str) -> DeliveryView | None:
         with self.connect() as connection:

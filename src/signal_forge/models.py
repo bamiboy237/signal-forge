@@ -158,3 +158,22 @@ class DispatchResult(Model):
     retried: int = 0
     dead: int = 0
     stale: int = 0
+
+
+class ReplayChange(Model):
+    event_id: str
+    before: Severity
+    after: Severity
+
+
+class ReplayBatch(Model):
+    batch_id: str
+    ruleset_version: int
+    before: dict[Severity, int]
+    after: dict[Severity, int]
+    changes: list[ReplayChange]
+
+
+class ReplayResult(Model):
+    version: int
+    batches: list[ReplayBatch]

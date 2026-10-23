@@ -19,8 +19,12 @@ from .models import (
     DispatchResult,
     Health,
     PipelineReport,
+    ReplayRequest,
+    ReplayResult,
+    RuleSetRequest,
+    RuleSetView,
 )
-from .storage import BatchNotFound, BatchNotReady, IdempotencyConflict, Store
+from .storage import BatchNotFound, BatchNotReady, IdempotencyConflict, RuleSetNotFound, Store
 
 IdempotencyKey = Annotated[
     str,
@@ -59,6 +63,10 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     async def not_found(request: Request, exc: BatchNotFound) -> JSONResponse:
         return JSONResponse(status_code=404, content={"detail": "Batch not found"})
 
+    @app.exception_handler(RuleSetNotFound)
+    async def rules_not_found(request: Request, exc: RuleSetNotFound) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"detail": "Rule set not found"})
+
     @app.exception_handler(BatchNotReady)
     async def not_ready(request: Request, exc: BatchNotReady) -> JSONResponse:
         return JSONResponse(
@@ -88,6 +96,32 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     def health() -> Health:
         store.health()
         return Health(status="ok")
+
+    @app.get("/v1/rules", tags=["rules"])
+    def list_rules() -> list[RuleSetView]:
+        return store.list_rules()
+
+    @app.get("/v1/rules/active", tags=["rules"])
+    def active_rules() -> RuleSetView:
+        return store.get_rules()
+
+    @app.post("/v1/rules", status_code=201, tags=["rules"])
+    def create_rules(body: RuleSetRequest, response: Response) -> RuleSetView:
+        view = store.create_rules(body)
+        response.headers["Location"] = f"/v1/rules/{view.version}"
+        return view
+
+    @app.get("/v1/rules/{version}", tags=["rules"])
+    def get_rules(version: int) -> RuleSetView:
+        return store.get_rules(version)
+
+    @app.post("/v1/rules/{version}/activate", tags=["rules"])
+    def activate_rules(version: int) -> RuleSetView:
+        return store.activate_rules(version)
+
+    @app.post("/v1/rules/{version}/replay", tags=["rules"])
+    def replay_rules(version: int, body: ReplayRequest) -> ReplayResult:
+        return store.replay(version, body.limit)
 
     @app.post("/v1/batches", status_code=202, tags=["batches"])
     def submit_batch(
