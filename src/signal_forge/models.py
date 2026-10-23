@@ -128,7 +128,7 @@ class Rule(Model):
 
 class RuleSetRequest(Model):
     rules: list[Rule] = Field(min_length=1, max_length=50)
-    note: str = Field(default="", max_length=200)
+    note: str | None = Field(default=None, max_length=200)
 
     @field_validator("rules")
     @classmethod
