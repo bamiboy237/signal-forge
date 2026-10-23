@@ -81,3 +81,32 @@ class BatchView(Model):
 
 class Health(Model):
     status: Literal["ok"]
+
+
+class DeliveryPayload(Model):
+    delivery_id: str
+    batch_id: str
+    pipeline_version: str
+    severity_counts: dict[Severity, int]
+
+
+class DeliveryView(Model):
+    id: str
+    batch_id: str
+    payload: DeliveryPayload
+    status: Literal["pending", "in_flight", "succeeded", "dead"]
+    attempt_count: int
+    next_attempt_at: AwareDatetime | None
+    last_error: str | None
+
+
+class DispatchRequest(Model):
+    limit: int = Field(default=10, ge=1, le=100, strict=True)
+
+
+class DispatchResult(Model):
+    attempted: int = 0
+    succeeded: int = 0
+    retried: int = 0
+    dead: int = 0
+    stale: int = 0

@@ -3,11 +3,11 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from .models import BatchRequest, BatchView, PipelineReport
+from .models import BatchRequest, BatchView, DeliveryPayload, DeliveryView, PipelineReport
 from .pipeline import run_pipeline
 
 
@@ -62,6 +62,26 @@ class Store:
                     )
                 )
                 """
+            )
+
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS deliveries (
+                    id TEXT PRIMARY KEY,
+                    batch_id TEXT NOT NULL UNIQUE REFERENCES batches(id),
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN
+                        ('pending', 'in_flight', 'succeeded', 'dead')),
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT,
+                    last_error TEXT,
+                    claim_id TEXT,
+                    claim_expires_at TEXT
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries(status, next_attempt_at)"
             )
 
     def health(self) -> None:
@@ -135,4 +155,92 @@ class Store:
                 """,
                 (datetime.now(UTC).isoformat(), report.model_dump_json(), batch_id),
             )
+            if report.severity_counts["warning"] or report.severity_counts["critical"]:
+                delivery_id = str(uuid4())
+                payload = DeliveryPayload(
+                    delivery_id=delivery_id,
+                    batch_id=batch_id,
+                    pipeline_version=report.pipeline_version,
+                    severity_counts=report.severity_counts,
+                )
+                connection.execute(
+                    """INSERT INTO deliveries (id, batch_id, payload, status, next_attempt_at)
+                    VALUES (?, ?, ?, 'pending', ?)""",
+                    (
+                        delivery_id,
+                        batch_id,
+                        payload.model_dump_json(),
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
             return report
+
+    def delivery(self, batch_id: str) -> DeliveryView | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM deliveries WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return DeliveryView(
+                **{name: row[name] for name in DeliveryView.model_fields if name != "payload"},
+                payload=DeliveryPayload.model_validate_json(row["payload"]),
+            )
+
+    def claim(self, now: datetime, excluded: list[str]) -> dict | None:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            # A reserved attempt counts even if its worker disappears before recording a result.
+            connection.execute(
+                """UPDATE deliveries SET status = 'dead', next_attempt_at = NULL,
+                last_error = 'Claim expired after final attempt', claim_id = NULL,
+                claim_expires_at = NULL WHERE status = 'in_flight'
+                AND claim_expires_at <= ? AND attempt_count >= 5""",
+                (now.isoformat(),),
+            )
+            placeholders = ",".join("?" for _ in excluded) or "''"
+            row = connection.execute(
+                f"""SELECT * FROM deliveries WHERE id NOT IN ({placeholders}) AND
+                ((status = 'pending' AND next_attempt_at <= ?)
+                OR (status = 'in_flight' AND claim_expires_at <= ?))
+                ORDER BY next_attempt_at, id LIMIT 1""",
+                (*excluded, now.isoformat(), now.isoformat()),
+            ).fetchone()
+            if row is None:
+                return None
+            claim_id = str(uuid4())
+            connection.execute(
+                """UPDATE deliveries SET status = 'in_flight', claim_id = ?,
+                claim_expires_at = ?, attempt_count = attempt_count + 1 WHERE id = ?""",
+                (claim_id, (now + timedelta(seconds=60)).isoformat(), row["id"]),
+            )
+            return dict(row) | {"claim_id": claim_id, "attempt_count": row["attempt_count"] + 1}
+
+    def finish(self, claim: dict, now: datetime, code: int | None) -> str:
+        success = code is not None and 200 <= code < 300
+        retryable = code is None or code == 429 or 500 <= code < 600
+        outcome = (
+            "succeeded"
+            if success
+            else ("retried" if retryable and claim["attempt_count"] < 5 else "dead")
+        )
+        next_at = (
+            (now + timedelta(seconds=2 ** (claim["attempt_count"] - 1))).isoformat()
+            if outcome == "retried"
+            else None
+        )
+        error = None if success else ("Network failure" if code is None else f"HTTP {code}")
+        with self.connect() as connection:
+            updated = connection.execute(
+                """UPDATE deliveries SET status = ?, next_attempt_at = ?, last_error = ?,
+                claim_id = NULL, claim_expires_at = NULL
+                WHERE id = ? AND status = 'in_flight' AND claim_id = ?""",
+                (
+                    "pending" if outcome == "retried" else outcome,
+                    next_at,
+                    error,
+                    claim["id"],
+                    claim["claim_id"],
+                ),
+            )
+            return outcome if updated.rowcount else "stale"

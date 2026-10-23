@@ -5,11 +5,21 @@ from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import FastAPI, Header, Request, Response
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from .models import BatchRequest, BatchView, Health, PipelineReport
+from .delivery import dispatch
+from .models import (
+    BatchRequest,
+    BatchView,
+    DeliveryView,
+    DispatchRequest,
+    DispatchResult,
+    Health,
+    PipelineReport,
+)
 from .storage import BatchNotFound, BatchNotReady, IdempotencyConflict, Store
 
 IdempotencyKey = Annotated[
@@ -101,5 +111,24 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     @app.get("/v1/batches/{batch_id}/report", tags=["batches"])
     def get_report(batch_id: UUID) -> PipelineReport:
         return store.report(str(batch_id))
+
+    @app.get("/v1/batches/{batch_id}/delivery", tags=["deliveries"])
+    def get_delivery(batch_id: UUID) -> DeliveryView:
+        delivery = store.delivery(str(batch_id))
+        if delivery is None:
+            raise HTTPException(404, "Delivery not found")
+        return delivery
+
+    @app.post("/v1/deliveries/dispatch", tags=["deliveries"])
+    def dispatch_deliveries(body: DispatchRequest) -> DispatchResult:
+        url = os.environ.get("SIGNAL_FORGE_WEBHOOK_URL", "")
+        try:
+            parsed = httpx.URL(url)
+            valid = parsed.scheme == "https" and bool(parsed.host)
+        except Exception:
+            valid = False
+        if not valid:
+            raise HTTPException(503, "Webhook requires a configured HTTPS URL")
+        return dispatch(store, url, body.limit)
 
     return app
