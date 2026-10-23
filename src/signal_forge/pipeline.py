@@ -2,14 +2,19 @@ from signal_forge.models import (
     BatchRequest,
     PipelineReport,
     QuarantinedReading,
+    Rule,
     ScoredReading,
     Severity,
 )
 
+from .rules import DEFAULT_RULES, score_rules
+
 PIPELINE_VERSION = "1"
 
 
-def run_pipeline(batch: BatchRequest) -> PipelineReport:
+def run_pipeline(
+    batch: BatchRequest, rules: list[Rule] | None = None, ruleset_version: int = 1
+) -> PipelineReport:
     """Normalize and score readings without changing the batch or using external state."""
     seen_event_ids: set[str] = set()
     readings: list[ScoredReading] = []
@@ -53,27 +58,6 @@ def run_pipeline(batch: BatchRequest) -> PipelineReport:
             )
             continue
 
-        severity: Severity
-        if reading.kind == "temperature":
-            if value >= 80:
-                severity = "critical"
-                reason = "Temperature is at or above 80 C."
-            elif value >= 60:
-                severity = "warning"
-                reason = "Temperature is at or above 60 C and below 80 C."
-            else:
-                severity = "normal"
-                reason = "Temperature is below 60 C."
-        elif value < 20:
-            severity = "warning"
-            reason = "Humidity is below 20 %."
-        elif value > 80:
-            severity = "warning"
-            reason = "Humidity is above 80 %."
-        else:
-            severity = "normal"
-            reason = "Humidity is between 20 % and 80 %, inclusive."
-
         readings.append(
             ScoredReading(
                 event_id=reading.event_id,
@@ -82,14 +66,22 @@ def run_pipeline(batch: BatchRequest) -> PipelineReport:
                 kind=reading.kind,
                 value=value,
                 unit=unit,
-                severity=severity,
-                reason=reason,
+                severity="normal",
+                reason="No rule matched.",
             )
         )
-        severity_counts[severity] += 1
+
+    selected_rules = rules if rules is not None else [Rule.model_validate(r) for r in DEFAULT_RULES]
+    history: list[ScoredReading] = []
+    # Stable sorting preserves batch position for equal timestamps; output stays in input order.
+    for reading in sorted(readings, key=lambda item: item.observed_at):
+        history.append(reading)
+        reading.severity, reading.reason = score_rules(selected_rules, reading, history)
+        severity_counts[reading.severity] += 1
 
     return PipelineReport(
         pipeline_version=PIPELINE_VERSION,
+        ruleset_version=ruleset_version,
         total=len(batch.readings),
         accepted=len(readings),
         quarantined=len(quarantine),

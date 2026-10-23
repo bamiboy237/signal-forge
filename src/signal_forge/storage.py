@@ -7,8 +7,20 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from .models import BatchRequest, BatchView, DeliveryPayload, DeliveryView, PipelineReport
+from .models import (
+    BatchRequest,
+    BatchView,
+    DeliveryPayload,
+    DeliveryView,
+    PipelineReport,
+    ReplayBatch,
+    ReplayChange,
+    ReplayResult,
+    RuleSetRequest,
+    RuleSetView,
+)
 from .pipeline import run_pipeline
+from .rules import DEFAULT_RULES
 
 
 class BatchNotFound(Exception):
@@ -20,6 +32,10 @@ class BatchNotReady(Exception):
 
 
 class IdempotencyConflict(Exception):
+    pass
+
+
+class RuleSetNotFound(Exception):
     pass
 
 
@@ -83,6 +99,76 @@ class Store:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries(status, next_attempt_at)"
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS rule_sets (
+                    version INTEGER PRIMARY KEY, rules TEXT NOT NULL, note TEXT,
+                    created_at TEXT NOT NULL, active INTEGER NOT NULL CHECK (active IN (0, 1))
+                )"""
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS one_active_ruleset ON rule_sets(active) "
+                "WHERE active = 1"
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO rule_sets VALUES (1, ?, NULL, ?, 1)",
+                (json.dumps(DEFAULT_RULES), datetime.now(UTC).isoformat()),
+            )
+
+    @staticmethod
+    def _ruleset(row: sqlite3.Row) -> RuleSetView:
+        return RuleSetView(
+            version=row["version"],
+            rules=json.loads(row["rules"]),
+            note=row["note"],
+            created_at=row["created_at"],
+            active=bool(row["active"]),
+        )
+
+    @staticmethod
+    def _find_ruleset(connection: sqlite3.Connection, version: int) -> sqlite3.Row:
+        row = connection.execute("SELECT * FROM rule_sets WHERE version = ?", (version,)).fetchone()
+        if row is None:
+            raise RuleSetNotFound(version)
+        return row
+
+    def list_rules(self) -> list[RuleSetView]:
+        with self.connect() as connection:
+            return [
+                self._ruleset(row)
+                for row in connection.execute("SELECT * FROM rule_sets ORDER BY version")
+            ]
+
+    def get_rules(self, version: int | None = None) -> RuleSetView:
+        with self.connect() as connection:
+            row = (
+                connection.execute("SELECT * FROM rule_sets WHERE active = 1").fetchone()
+                if version is None
+                else self._find_ruleset(connection, version)
+            )
+            return self._ruleset(row)
+
+    def create_rules(self, body: RuleSetRequest) -> RuleSetView:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            version = connection.execute("SELECT MAX(version) + 1 FROM rule_sets").fetchone()[0]
+            connection.execute(
+                "INSERT INTO rule_sets VALUES (?, ?, ?, ?, 0)",
+                (
+                    version,
+                    json.dumps([r.model_dump() for r in body.rules]),
+                    body.note,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            return self._ruleset(self._find_ruleset(connection, version))
+
+    def activate_rules(self, version: int) -> RuleSetView:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._find_ruleset(connection, version)
+            connection.execute("UPDATE rule_sets SET active = 0 WHERE active = 1")
+            connection.execute("UPDATE rule_sets SET active = 1 WHERE version = ?", (version,))
+            return self._ruleset(self._find_ruleset(connection, version))
 
     def health(self) -> None:
         with self.connect() as connection:
@@ -148,7 +234,15 @@ class Store:
             row = self._find(connection, batch_id)
             if row["status"] == "completed":
                 return PipelineReport.model_validate_json(row["report"])
-            report = run_pipeline(BatchRequest.model_validate_json(row["payload"]))
+            active = self._ruleset(
+                connection.execute("SELECT * FROM rule_sets WHERE active = 1").fetchone()
+            )
+            batch = BatchRequest.model_validate_json(row["payload"])
+            report = (
+                run_pipeline(batch)
+                if active.version == 1
+                else run_pipeline(batch, active.rules, active.version)
+            )
             connection.execute(
                 """
                 UPDATE batches SET status = 'completed', completed_at = ?, report = ? WHERE id = ?
@@ -174,6 +268,39 @@ class Store:
                     ),
                 )
             return report
+
+    def replay(self, version: int, limit: int) -> ReplayResult:
+        with self.connect() as connection:
+            # One read snapshot covers the selected version and all original reports.
+            connection.execute("BEGIN")
+            ruleset = self._ruleset(self._find_ruleset(connection, version))
+            rows = connection.execute(
+                "SELECT * FROM batches WHERE status = 'completed' "
+                "ORDER BY completed_at DESC, rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            batches = []
+            for row in rows:
+                before = PipelineReport.model_validate_json(row["report"])
+                after = run_pipeline(
+                    BatchRequest.model_validate_json(row["payload"]), ruleset.rules, version
+                )
+                batches.append(
+                    ReplayBatch(
+                        batch_id=row["id"],
+                        ruleset_version=before.ruleset_version,
+                        before=before.severity_counts,
+                        after=after.severity_counts,
+                        changes=[
+                            ReplayChange(
+                                event_id=old.event_id, before=old.severity, after=new.severity
+                            )
+                            for old, new in zip(before.readings, after.readings, strict=True)
+                            if old.severity != new.severity
+                        ],
+                    )
+                )
+            return ReplayResult(version=version, batches=batches)
 
     def delivery(self, batch_id: str) -> DeliveryView | None:
         with self.connect() as connection:
